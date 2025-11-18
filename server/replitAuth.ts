@@ -8,15 +8,22 @@ import memoize from "memoizee";
 import connectPg from "connect-pg-simple";
 import { storage } from "./storage";
 
-const getOidcConfig = memoize(
-  async () => {
-    return await client.discovery(
-      new URL(process.env.ISSUER_URL ?? "https://replit.com/oidc"),
-      process.env.REPL_ID!
-    );
-  },
-  { maxAge: 3600 * 1000 }
-);
+const isAuthEnabled = !!process.env.REPL_ID && !!process.env.REPLIT_CLIENT_SECRET;
+
+const getOidcConfig = isAuthEnabled
+  ? memoize(
+      async () => {
+        return await client.discovery(
+          new URL(process.env.ISSUER_URL ?? "https://replit.com/oidc"),
+          process.env.REPL_ID!
+        );
+      },
+      { maxAge: 3600 * 1000 }
+    )
+  : async () => {
+      console.warn("⚠️ Replit OAuth disabled — missing REPL_ID or REPLIT_CLIENT_SECRET");
+      return null as unknown as client.Issuer<Client>;
+    };
 
 export function getSession() {
   const sessionTtl = 7 * 24 * 60 * 60 * 1000; // 1 week
@@ -28,13 +35,13 @@ export function getSession() {
     tableName: "sessions",
   });
   return session({
-    secret: process.env.SESSION_SECRET!,
+    secret: process.env.SESSION_SECRET || "dev-secret",
     store: sessionStore,
     resave: false,
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      secure: true,
+      secure: process.env.NODE_ENV === "production",
       maxAge: sessionTtl,
     },
   });
@@ -50,28 +57,17 @@ function updateUserSession(
   user.expires_at = user.claims?.exp;
 }
 
-async function upsertUser(
-  claims: any,
-) {
+async function upsertUser(claims: any) {
   const userId = claims["sub"];
   const existingUser = await storage.getUser(userId);
-  
-  // Check if this is a new user and if there are any existing users
-  // If this is the first user in the system, make them an admin
+
   let role: string | undefined = undefined;
   if (!existingUser) {
-    // Check if any users exist in the system
     const allUsers = await storage.getAllUsers();
-    if (allUsers.length === 0) {
-      // This is the first user, make them admin
-      role = 'admin';
-      console.log(`First user ${claims["email"]} created with admin role`);
-    } else {
-      // Not the first user, default role will be set by database (partner)
-      role = 'partner';
-    }
+    role = allUsers.length === 0 ? "admin" : "partner";
+    if (role === "admin") console.log(`First user ${claims["email"]} created with admin role`);
   }
-  
+
   await storage.upsertUser({
     id: userId,
     email: claims["email"],
@@ -88,6 +84,8 @@ export async function setupAuth(app: Express) {
   app.use(passport.initialize());
   app.use(passport.session());
 
+  if (!isAuthEnabled) return;
+
   const config = await getOidcConfig();
 
   const verify: VerifyFunction = async (
@@ -100,10 +98,8 @@ export async function setupAuth(app: Express) {
     verified(null, user);
   };
 
-  // Keep track of registered strategies
   const registeredStrategies = new Set<string>();
 
-  // Helper function to ensure strategy exists for a domain
   const ensureStrategy = (domain: string) => {
     const strategyName = `replitauth:${domain}`;
     if (!registeredStrategies.has(strategyName)) {
@@ -114,7 +110,7 @@ export async function setupAuth(app: Express) {
           scope: "openid email profile offline_access",
           callbackURL: `https://${domain}/api/callback`,
         },
-        verify,
+        verify
       );
       passport.use(strategy);
       registeredStrategies.add(strategyName);
@@ -142,6 +138,7 @@ export async function setupAuth(app: Express) {
 
   app.get("/api/logout", (req, res) => {
     req.logout(() => {
+      if (!config) return res.redirect("/");
       res.redirect(
         client.buildEndSessionUrl(config, {
           client_id: process.env.REPL_ID!,
@@ -153,6 +150,8 @@ export async function setupAuth(app: Express) {
 }
 
 export const isAuthenticated: RequestHandler = async (req, res, next) => {
+  if (!isAuthEnabled) return next();
+
   const user = req.user as any;
 
   if (!req.isAuthenticated() || !user.expires_at) {
@@ -160,23 +159,17 @@ export const isAuthenticated: RequestHandler = async (req, res, next) => {
   }
 
   const now = Math.floor(Date.now() / 1000);
-  if (now <= user.expires_at) {
-    return next();
-  }
+  if (now <= user.expires_at) return next();
 
   const refreshToken = user.refresh_token;
-  if (!refreshToken) {
-    res.status(401).json({ message: "Unauthorized" });
-    return;
-  }
+  if (!refreshToken) return res.status(401).json({ message: "Unauthorized" });
 
   try {
     const config = await getOidcConfig();
     const tokenResponse = await client.refreshTokenGrant(config, refreshToken);
     updateUserSession(user, tokenResponse);
     return next();
-  } catch (error) {
-    res.status(401).json({ message: "Unauthorized" });
-    return;
+  } catch {
+    return res.status(401).json({ message: "Unauthorized" });
   }
 };
